@@ -9421,3 +9421,32 @@ fn ml_dsa() {
     let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
     do_handshake(&mut client, &mut server);
 }
+
+#[test]
+#[cfg(feature = "tls12")]
+fn runtime_tls_unique_matches_peer_and_changes_for_resumption() {
+    let provider = provider::default_provider();
+    let kt = KeyType::all_for_provider(&provider)[0];
+    let server_config = make_server_config(kt, &provider);
+    let client_config = make_client_config_with_versions(kt, &[&rustls::version::TLS12], &provider);
+    let (mut client, mut server) =
+        make_pair_for_configs(client_config.clone(), server_config.clone());
+    assert!(client.tls_unique().is_none());
+    assert!(server.tls_unique().is_none());
+    do_handshake(&mut client, &mut server);
+    let first = client.tls_unique().unwrap().to_vec();
+    assert_eq!(first.len(), 12);
+    assert_eq!(Some(first.as_slice()), server.tls_unique());
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert_eq!(client.tls_unique(), server.tls_unique());
+    assert_ne!(client.tls_unique().unwrap(), first);
+    let (mut client, mut server) = make_pair_for_configs(
+        make_client_config_with_versions(kt, &[&rustls::version::TLS13], &provider),
+        make_server_config(kt, &provider),
+    );
+    do_handshake(&mut client, &mut server);
+    assert!(client.tls_unique().is_none());
+    assert!(server.tls_unique().is_none());
+}

@@ -29,6 +29,8 @@ use crate::{quic, record_layer};
 
 /// Connection state common to both client and server connections.
 pub struct CommonState {
+    pub(crate) tls12_first_finished: Option<[u8; 12]>,
+    pub(crate) tls12_extended_master_secret: bool,
     pub(crate) negotiated_version: Option<ProtocolVersion>,
     pub(crate) handshake_kind: Option<HandshakeKind>,
     pub(crate) side: Side,
@@ -66,6 +68,8 @@ pub struct CommonState {
 impl CommonState {
     pub(crate) fn new(side: Side) -> Self {
         Self {
+            tls12_first_finished: None,
+            tls12_extended_master_secret: false,
             negotiated_version: None,
             handshake_kind: None,
             side,
@@ -95,6 +99,25 @@ impl CommonState {
             fips: false,
             tls13_tickets_received: 0,
         }
+    }
+
+    /// RFC 5929 tls-unique channel binding for this completed TLS 1.2 handshake.
+    ///
+    /// Returns the first Finished message's verify_data, whether this was a
+    /// full or resumed handshake. It is unavailable before authenticated
+    /// handshake completion, without RFC 7627 extended master secret, or for
+    /// TLS 1.3. For TLS 1.3 use the RFC 9266 tls-exporter construction instead.
+    /// This does not return a certificate hash or a session's master secret.
+    pub fn tls_unique(&self) -> Option<&[u8]> {
+        if self.negotiated_version != Some(ProtocolVersion::TLSv1_2)
+            || self.is_handshaking()
+            || !self.tls12_extended_master_secret
+        {
+            return None;
+        }
+        self.tls12_first_finished
+            .as_ref()
+            .map(|value| value.as_slice())
     }
 
     /// Returns true if the caller should call [`Connection::write_tls`] as soon as possible.
