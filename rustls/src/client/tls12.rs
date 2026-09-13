@@ -607,6 +607,9 @@ fn emit_finished(
 ) {
     let vh = transcript.current_hash();
     let verify_data = secrets.client_verify_data(&vh);
+    if common.tls12_first_finished.is_none() {
+        common.tls12_first_finished = verify_data.as_slice().try_into().ok();
+    }
     let verify_data_payload = Payload::new(verify_data);
 
     let f = Message {
@@ -1273,6 +1276,11 @@ impl State<ClientConnectionData> for ExpectFinished {
                         .send_fatal_alert(AlertDescription::DecryptError, Error::DecryptError));
                 }
             };
+
+        if cx.common.tls12_first_finished.is_none() {
+            cx.common.tls12_first_finished = finished.bytes().try_into().ok();
+        }
+        cx.common.tls12_extended_master_secret = st.using_ems;
 
         // Hash this message too.
         st.transcript.add_message(&m);
