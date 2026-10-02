@@ -43,6 +43,7 @@ pub struct CommonState {
     pub(crate) may_receive_application_data: bool,
     pub(crate) early_traffic: bool,
     sent_fatal_alert: bool,
+    pub(crate) encryption_exhausted: bool,
     /// If we signaled end of stream.
     pub(crate) has_sent_close_notify: bool,
     /// If the peer has signaled end of stream.
@@ -82,6 +83,7 @@ impl CommonState {
             may_receive_application_data: false,
             early_traffic: false,
             sent_fatal_alert: false,
+            encryption_exhausted: false,
             has_sent_close_notify: false,
             has_received_close_notify: false,
             #[cfg(feature = "std")]
@@ -261,6 +263,9 @@ impl CommonState {
         payload: OutboundChunks<'_>,
         outgoing_tls: &mut [u8],
     ) -> Result<usize, EncryptError> {
+        if self.encryption_exhausted {
+            return Err(EncryptError::EncryptExhausted);
+        }
         if payload.is_empty() {
             return Ok(0);
         }
@@ -288,11 +293,13 @@ impl CommonState {
                         error!(
                             "traffic keys exhausted, closing connection to prevent security failure"
                         );
+                        self.encryption_exhausted = true;
                         self.send_close_notify();
                         return Err(EncryptError::EncryptExhausted);
                     }
                 },
                 PreEncryptAction::Refuse => {
+                    self.encryption_exhausted = true;
                     return Err(EncryptError::EncryptExhausted);
                 }
             }
@@ -335,7 +342,9 @@ impl CommonState {
             .message_fragmenter
             .fragment_message(&m);
         for m in iter {
-            self.send_single_fragment(m);
+            if !self.send_single_fragment(m) {
+                break;
+            }
         }
     }
 
@@ -360,19 +369,37 @@ impl CommonState {
                 ProtocolVersion::TLSv1_2,
                 payload.split_at(len).0,
             );
+        let mut accepted = 0;
         for m in iter {
-            self.send_single_fragment(m);
+            let fragment_len = m.payload.len();
+            if !self.send_single_fragment(m) {
+                break;
+            }
+            accepted += fragment_len;
         }
 
-        len
+        accepted
     }
 
-    fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) {
+    fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) -> bool {
         if m.typ == ContentType::Alert {
-            // Alerts are always sendable -- never quashed by a PreEncryptAction.
+            // Reserve the soft-limit record for close_notify, but never cross
+            // the hard sequence limit, including when called after exhaustion.
+            if matches!(
+                self.record_layer
+                    .next_pre_encrypt_action(),
+                PreEncryptAction::Refuse
+            ) {
+                self.encryption_exhausted = true;
+                return false;
+            }
             let em = self.record_layer.encrypt_outgoing(m);
             self.queue_tls_message(em);
-            return;
+            return true;
+        }
+
+        if self.encryption_exhausted {
+            return false;
         }
 
         match self
@@ -393,8 +420,9 @@ impl CommonState {
                         error!(
                             "traffic keys exhausted, closing connection to prevent security failure"
                         );
+                        self.encryption_exhausted = true;
                         self.send_close_notify();
-                        return;
+                        return false;
                     }
                 }
             }
@@ -402,12 +430,14 @@ impl CommonState {
             // Refuse to wrap counter at all costs.  This
             // is basically untestable unfortunately.
             PreEncryptAction::Refuse => {
-                return;
+                self.encryption_exhausted = true;
+                return false;
             }
         };
 
         let em = self.record_layer.encrypt_outgoing(m);
         self.queue_tls_message(em);
+        true
     }
 
     fn send_plain_non_buffering(&mut self, payload: OutboundChunks<'_>, limit: Limit) -> usize {

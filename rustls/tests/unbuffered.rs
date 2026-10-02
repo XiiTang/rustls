@@ -850,6 +850,10 @@ fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
                 let used = match wt.encrypt(message.as_bytes(), &mut buffer) {
                     Ok(used) => used,
                     Err(EncryptError::EncryptExhausted) if i == CONFIDENTIALITY_LIMIT - 1 => {
+                        assert!(matches!(
+                            wt.encrypt(b"after exhaustion", &mut buffer),
+                            Err(EncryptError::EncryptExhausted)
+                        ));
                         break;
                     }
                     rc @ Err(_) => rc.unwrap(),

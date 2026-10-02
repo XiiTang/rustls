@@ -351,6 +351,24 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
         fn flush(&mut self) -> io::Result<()>;
     }
 
+    impl<T> ConnectionCommon<T> {
+        fn check_encryption_result(&self, accepted: usize) -> io::Result<usize> {
+            if accepted == 0
+                && self
+                    .core
+                    .common_state
+                    .encryption_exhausted
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    Error::EncryptError,
+                ))
+            } else {
+                Ok(accepted)
+            }
+        }
+    }
+
     impl<T> PlaintextSink for ConnectionCommon<T> {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             let len = self
@@ -358,7 +376,7 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
                 .common_state
                 .buffer_plaintext(buf.into(), &mut self.sendable_plaintext);
             self.core.maybe_refresh_traffic_keys();
-            Ok(len)
+            self.check_encryption_result(len)
         }
 
         fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
@@ -380,11 +398,12 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
                 .common_state
                 .buffer_plaintext(payload, &mut self.sendable_plaintext);
             self.core.maybe_refresh_traffic_keys();
-            Ok(len)
+            self.check_encryption_result(len)
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            self.check_encryption_result(0)
+                .map(|_| ())
         }
     }
 }
@@ -938,6 +957,10 @@ impl<Data> ConnectionCore<Data> {
         }
 
         deframer_buffer.discard(buffer_progress.take_discard());
+        if self.common_state.encryption_exhausted {
+            self.state = Err(Error::EncryptError);
+            return Err(Error::EncryptError);
+        }
         self.state = Ok(state);
         Ok(self.common_state.current_io_state())
     }
