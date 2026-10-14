@@ -361,6 +361,17 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
         /// Return the fatal error this connection previously encountered, if any.
         fn check_error(&self) -> io::Result<()> {
             match &self.core.state {
+                Ok(_)
+                    if self
+                        .core
+                        .common_state
+                        .encryption_exhausted =>
+                {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        Error::EncryptError,
+                    ))
+                }
                 Ok(_) => Ok(()),
                 Err(err) => Err(io::Error::new(io::ErrorKind::InvalidData, err.clone())),
             }
@@ -386,7 +397,11 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
     impl<T> PlaintextSink for ConnectionCommon<T> {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.check_error()?;
-            Ok(self.send_plaintext(buf.into()))
+            let len = self.send_plaintext(buf.into());
+            if len == 0 {
+                self.check_error()?;
+            }
+            Ok(len)
         }
 
         fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
@@ -404,7 +419,11 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
                     OutboundChunks::new(&payload_owner)
                 }
             };
-            Ok(self.send_plaintext(payload))
+            let len = self.send_plaintext(payload);
+            if len == 0 {
+                self.check_error()?;
+            }
+            Ok(len)
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -962,6 +981,10 @@ impl<Data> ConnectionCore<Data> {
         }
 
         deframer_buffer.discard(buffer_progress.take_discard());
+        if self.common_state.encryption_exhausted {
+            self.state = Err(Error::EncryptError);
+            return Err(Error::EncryptError);
+        }
         self.state = Ok(state);
         Ok(self.common_state.current_io_state())
     }

@@ -819,6 +819,15 @@ fn refresh_traffic_keys_automatically() {
 
 #[test]
 fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
+    tls12_exhaustion(false);
+}
+
+#[test]
+fn tls12_fragmented_encryption_keeps_exhaustion_on_later_calls() {
+    tls12_exhaustion(true);
+}
+
+fn tls12_exhaustion(fragmented: bool) {
     const CONFIDENTIALITY_LIMIT: usize = 1024;
 
     let client_config = finish_client_config(
@@ -849,9 +858,36 @@ fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
                 let message = format!("{i:08}");
 
                 let mut buffer = [0u8; 64];
+                if fragmented && i == CONFIDENTIALITY_LIMIT - 2 {
+                    // Two fragments cross the limit while one record would
+                    // still fit. A later smaller write must not bypass closure.
+                    let payload = vec![0; 16385];
+                    let mut outgoing = vec![0; 17000];
+                    assert!(matches!(
+                        wt.encrypt(&payload, &mut outgoing),
+                        Err(EncryptError::EncryptExhausted)
+                    ));
+                    assert!(matches!(
+                        wt.encrypt(b"after exhaustion", &mut buffer),
+                        Err(EncryptError::EncryptExhausted)
+                    ));
+                    assert!(matches!(
+                        wt.encrypt(b"", &mut buffer),
+                        Err(EncryptError::EncryptExhausted)
+                    ));
+                    break;
+                }
                 let used = match wt.encrypt(message.as_bytes(), &mut buffer) {
                     Ok(used) => used,
                     Err(EncryptError::EncryptExhausted) if i == CONFIDENTIALITY_LIMIT - 1 => {
+                        assert!(matches!(
+                            wt.encrypt(b"after exhaustion", &mut buffer),
+                            Err(EncryptError::EncryptExhausted)
+                        ));
+                        assert!(matches!(
+                            wt.encrypt(b"", &mut buffer),
+                            Err(EncryptError::EncryptExhausted)
+                        ));
                         break;
                     }
                     rc @ Err(_) => rc.unwrap(),

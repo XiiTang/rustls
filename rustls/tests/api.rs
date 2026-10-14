@@ -8936,18 +8936,33 @@ fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
 
     for i in 0..CONFIDENTIALITY_LIMIT {
         let message = format!("{i:08}");
-        client
+        let result = client
             .writer()
-            .write_all(message.as_bytes())
-            .unwrap();
+            .write(message.as_bytes());
         let (received, peer_closed) = receive(&mut client, &mut server);
 
         match i {
             1023 => {
+                assert!(result.is_err());
                 assert!(peer_closed);
                 assert_eq!(received.len(), 0);
+                assert!(
+                    client
+                        .writer()
+                        .write(b"after exhaustion")
+                        .is_err()
+                );
+                assert!(
+                    client
+                        .writer()
+                        .write_vectored(&[IoSlice::new(b"later")])
+                        .is_err()
+                );
+                assert!(client.writer().flush().is_err());
+                assert_eq!(transfer(&mut client, &mut server), 0);
             }
             _ => {
+                assert_eq!(result.unwrap(), message.len());
                 assert!(!peer_closed);
                 assert_eq!(&received, message.as_bytes());
             }
@@ -8992,10 +9007,12 @@ fn tls12_connection_fails_after_alert_at_confidentiality_limit() {
     });
 
     // No application data may be encrypted with the exhausted key.
-    client
-        .writer()
-        .write_all(b"later")
-        .unwrap();
+    assert!(
+        client
+            .writer()
+            .write_all(b"later")
+            .is_err()
+    );
     raw_server.receive_and_decrypt(&mut client, |m| {
         assert_eq!(
             format!("{m:?}"),
@@ -9006,7 +9023,7 @@ fn tls12_connection_fails_after_alert_at_confidentiality_limit() {
 
 #[cfg(feature = "tls12")]
 #[test]
-fn tls12_write_is_not_split_across_confidentiality_limit() {
+fn tls12_write_reports_the_prefix_before_confidentiality_limit() {
     let (mut client, mut server) = tls12_pair_with_limited_confidentiality();
 
     // Leave three records before the limit.
@@ -9031,14 +9048,22 @@ fn tls12_write_is_not_split_across_confidentiality_limit() {
     assert!(!peer_closed);
     assert_eq!(received, two_records);
 
-    // With one record left, none of a two-record write is sent.
-    client
+    // With one record left, report precisely the one-record prefix sent.
+    let accepted = client
         .writer()
-        .write_all(&two_records)
+        .write(&two_records)
         .unwrap();
+    assert_eq!(accepted, MAX_FRAGMENT_LEN);
     let (received, peer_closed) = receive(&mut client, &mut server);
     assert!(peer_closed);
-    assert_eq!(received.len(), 0);
+    assert_eq!(received, two_records[..accepted]);
+    assert!(
+        client
+            .writer()
+            .write(&two_records[accepted..])
+            .is_err()
+    );
+    assert!(client.writer().flush().is_err());
 }
 
 /// Complete a TLS 1.2 handshake using a suite limited to [`CONFIDENTIALITY_LIMIT`] records.
@@ -9449,4 +9474,85 @@ fn runtime_tls_unique_matches_peer_and_changes_for_resumption() {
     do_handshake(&mut client, &mut server);
     assert!(client.tls_unique().is_none());
     assert!(server.tls_unique().is_none());
+}
+
+#[cfg(feature = "tls12")]
+#[test]
+fn tls12_fragmented_writes_report_only_the_prefix_delivered_before_exhaustion() {
+    for vectored in [false, true] {
+        let provider = aes_128_gcm_with_1024_confidentiality_limit(provider::default_provider());
+        let client_config = finish_client_config(
+            KeyType::Ed25519,
+            ClientConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS12])
+                .unwrap(),
+        );
+        let server_config = finish_server_config(
+            KeyType::Ed25519,
+            ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap(),
+        );
+        let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+        do_handshake(&mut client, &mut server);
+        client.set_buffer_limit(None);
+        for _ in 0..1021 {
+            client.writer().write_all(b"x").unwrap();
+            transfer(&mut client, &mut server);
+            server.process_new_packets().unwrap();
+            let mut byte = [0];
+            server
+                .reader()
+                .read_exact(&mut byte)
+                .unwrap();
+            assert_eq!(byte, [b'x']);
+        }
+        let payload: Vec<u8> = (0..65536)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        let accepted = if vectored {
+            client
+                .writer()
+                .write_vectored(&[
+                    IoSlice::new(&payload[..20000]),
+                    IoSlice::new(&payload[20000..]),
+                ])
+                .unwrap()
+        } else {
+            client.writer().write(&payload).unwrap()
+        };
+        assert_eq!(accepted, 32768);
+        let mut wire = Vec::new();
+        client.write_tls(&mut wire).unwrap();
+        let mut received = Vec::new();
+        let mut wire = io::Cursor::new(wire);
+        while wire.position() < wire.get_ref().len() as u64 {
+            assert!(server.read_tls(&mut wire).unwrap() > 0);
+            server.process_new_packets().unwrap();
+            let mut plain = [0; 8192];
+            loop {
+                match server.reader().read(&mut plain) {
+                    Ok(0) => break,
+                    Ok(n) => received.extend_from_slice(&plain[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("unexpected peer read: {e}"),
+                }
+            }
+        }
+        assert_eq!(received, payload[..accepted]);
+        assert!(
+            client
+                .writer()
+                .write(&payload[accepted..])
+                .is_err()
+        );
+        assert!(
+            client
+                .writer()
+                .write_vectored(&[IoSlice::new(b"later")])
+                .is_err()
+        );
+        assert!(client.writer().flush().is_err());
+        assert_eq!(transfer(&mut client, &mut server), 0);
+    }
 }

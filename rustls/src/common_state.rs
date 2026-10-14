@@ -43,6 +43,7 @@ pub struct CommonState {
     pub(crate) may_receive_application_data: bool,
     pub(crate) early_traffic: bool,
     sent_fatal_alert: bool,
+    pub(crate) encryption_exhausted: bool,
     /// If we signaled end of stream.
     pub(crate) has_sent_close_notify: bool,
     /// If the peer has signaled end of stream.
@@ -82,6 +83,7 @@ impl CommonState {
             may_receive_application_data: false,
             early_traffic: false,
             sent_fatal_alert: false,
+            encryption_exhausted: false,
             has_sent_close_notify: false,
             has_received_close_notify: false,
             #[cfg(feature = "std")]
@@ -288,6 +290,9 @@ impl CommonState {
         payload: OutboundChunks<'_>,
         outgoing_tls: &mut [u8],
     ) -> Result<usize, EncryptError> {
+        if self.encryption_exhausted {
+            return Err(EncryptError::EncryptExhausted);
+        }
         if payload.is_empty() {
             return Ok(0);
         }
@@ -301,27 +306,8 @@ impl CommonState {
             );
 
         for f in 0..fragments.len() {
-            match self
-                .record_layer
-                .pre_encrypt_action(f as u64)
-            {
-                PreEncryptAction::Nothing => {}
-                PreEncryptAction::RefreshOrClose => match self.negotiated_version {
-                    Some(ProtocolVersion::TLSv1_3) => {
-                        // driven by caller, as we don't have the `State` here
-                        self.refresh_traffic_keys_pending = true;
-                    }
-                    _ => {
-                        error!(
-                            "traffic keys exhausted, closing connection to prevent security failure"
-                        );
-                        self.send_close_notify();
-                        return Err(EncryptError::EncryptExhausted);
-                    }
-                },
-                PreEncryptAction::Refuse => {
-                    return Err(EncryptError::EncryptExhausted);
-                }
+            if !self.check_pre_encrypt_action(f as u64) {
+                return Err(EncryptError::EncryptExhausted);
             }
         }
 
@@ -362,7 +348,9 @@ impl CommonState {
             .message_fragmenter
             .fragment_message(&m);
         for m in iter {
-            self.send_single_fragment(m);
+            if !self.send_single_fragment(m) {
+                break;
+            }
         }
     }
 
@@ -398,11 +386,13 @@ impl CommonState {
                 payload.split_at(len).0,
             );
 
-        // Check the record limit for the last fragment before encrypting any of them, so
-        // that a write crossing the limit is not sent in part.
+        // Preserve upstream's TLS 1.3 key-update preflight. TLS 1.2 instead
+        // reports only the prefix whose fragments were successfully encrypted.
         if let Some(last) = (iter.len() as u64).checked_sub(1) {
-            if !self.check_pre_encrypt_action(last) {
-                return len;
+            if self.negotiated_version == Some(ProtocolVersion::TLSv1_3)
+                && !self.check_pre_encrypt_action(last)
+            {
+                return 0;
             }
         }
 
@@ -420,33 +410,49 @@ impl CommonState {
                 return sent;
             }
 
-            sent += m.payload.len();
-            self.send_single_fragment(m);
+            let fragment_len = m.payload.len();
+            if !self.send_single_fragment(m) {
+                break;
+            }
+            sent += fragment_len;
         }
 
-        len
+        sent
     }
 
-    fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) {
+    fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) -> bool {
         if m.typ == ContentType::Alert {
-            // Alerts are always sendable -- never quashed by a PreEncryptAction.
+            // Keep the reserved close_notify record, but never cross the hard
+            // sequence limit, including after exhaustion.
+            if self
+                .record_layer
+                .next_pre_encrypt_action()
+                == PreEncryptAction::Refuse
+            {
+                self.encryption_exhausted = true;
+                return false;
+            }
             let em = self.record_layer.encrypt_outgoing(m);
             self.queue_tls_message(em);
-            return;
+            return true;
         }
 
         if !self.check_pre_encrypt_action(0) {
-            return;
+            return false;
         }
 
         let em = self.record_layer.encrypt_outgoing(m);
         self.queue_tls_message(em);
+        true
     }
 
     /// Take the remedial action needed before encrypting the record `add` records after the next.
     ///
     /// Returns `false` if that record must not be encrypted.
     fn check_pre_encrypt_action(&mut self, add: u64) -> bool {
+        if self.encryption_exhausted {
+            return false;
+        }
         match self
             .record_layer
             .pre_encrypt_action(add)
@@ -465,6 +471,7 @@ impl CommonState {
                     error!(
                         "traffic keys exhausted, closing connection to prevent security failure"
                     );
+                    self.encryption_exhausted = true;
                     self.send_close_notify();
                     false
                 }
@@ -472,7 +479,10 @@ impl CommonState {
 
             // Refuse to wrap counter at all costs.  This
             // is basically untestable unfortunately.
-            PreEncryptAction::Refuse => false,
+            PreEncryptAction::Refuse => {
+                self.encryption_exhausted = true;
+                false
+            }
         }
     }
 
