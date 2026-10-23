@@ -70,3 +70,14 @@ cargo test -p rustls --locked --no-default-features --features ring,std,tls12 --
 `tls12_fragmented_encryption_keeps_exhaustion_on_later_calls`,
 `runtime_tls_unique_matches_peer_and_changes_for_resumption`, and upstream's
 buffered/unbuffered automatic TLS 1.3 key-update and record-limit tests.
+
+## Reject distrusted certificate paths (#312)
+
+Raise the workspace rustls-webpki minimum to 0.103.16 and update both the
+workspace and fuzz lockfiles from 0.103.15. This is the smallest patched release
+for RUSTSEC-2026-0382: certificate verification must reject paths containing
+the distrusted emSign intermediate public keys. No rustls API or Boundless
+channel-binding/record-limit patch changes.
+
+Regression coverage: the ring/std/tls12 rustls library, API and unbuffered
+suites, plus Boundless TLS, network and HTTP host tests against this pin.
